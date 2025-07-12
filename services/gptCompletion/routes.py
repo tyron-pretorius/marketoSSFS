@@ -5,13 +5,13 @@ import os, requests, pandas as pd, json, traceback, pytz
 import googlesheets_functions
 from . import openai_functions
 
-bp = Blueprint("gptCompletion", __name__, url_prefix="/gptCompletion")
+base = "gptCompletion"
+bp = Blueprint(base, __name__, url_prefix=f"/{base}")
 
 # ---------- CONFIG ----------
-base = "gptCompletion"
-GC_SHEET_LEADS   = f"{base}Leads"
-GC_SHEET_BATCHES = f"{base}Batches"
-GC_SPREADSHEET_ID = "1DqUYub7vrnhEw2N5LOWRAWAZwYAzE3P-E-RPXqRhkws"
+SHEET_LEADS   = f"{base}Leads"
+SHEET_BATCHES = f"{base}Batches"
+SPREADSHEET_ID = "xxx" #change this
 pacific        = pytz.timezone("America/Los_Angeles")
 MAX_CELL = 50000          # Sheets’ absolute limit
 SAFE_SLICE = 48000        # leave UTF-8 head-room
@@ -94,7 +94,7 @@ def submit_async_action():
                     "leadData": { "id": lead_id , resp_field: answer},
                     "activityData": {
                         "system": sys_prompt,
-                        "user":    usr_prompt,
+                        "user-prompt":    usr_prompt,
                         "model": model_name,
                         "temperature": temp,
                         "output-tokens": max_tokens,
@@ -122,7 +122,7 @@ def submit_async_action():
                 "timestamp":    timestamp,
                 "lead_id":      f"https://app-ab20.marketo.com/leadDatabase/loadLeadDetail?leadId={lead_id}",
                 "system":       sys_prompt,
-                "user":          usr_prompt,
+                "user_prompt":          usr_prompt,
                 "model":        model_name,
                 "temperature":  temp,
                 "max_tokens":   max_tokens,
@@ -160,8 +160,8 @@ def submit_async_action():
         try:
             df_leads   = pd.DataFrame(rows_leads)
             df_batches = pd.DataFrame([batch_row])
-            googlesheets_functions.writeDF2Sheet(df_leads,   GC_SHEET_LEADS,   GC_SPREADSHEET_ID)
-            googlesheets_functions.writeDF2Sheet(df_batches, GC_SHEET_BATCHES, GC_SPREADSHEET_ID)
+            googlesheets_functions.writeDF2Sheet(df_leads,   SHEET_LEADS,   SPREADSHEET_ID)
+            googlesheets_functions.writeDF2Sheet(df_batches, SHEET_BATCHES, SPREADSHEET_ID)
         except Exception as gs_err:
             print("Sheets logging error:", gs_err)
 
@@ -177,7 +177,7 @@ def submit_async_action():
         fail_row |= _split_long_text("request", json.dumps(data, ensure_ascii=False))
         
         try:
-            googlesheets_functions.writeDF2Sheet(pd.DataFrame([fail_row]), GC_SHEET_BATCHES, GC_SPREADSHEET_ID)
+            googlesheets_functions.writeDF2Sheet(pd.DataFrame([fail_row]), SHEET_BATCHES, SPREADSHEET_ID)
         except Exception as gs_err:
             print("Sheets error while logging fatal failure:", gs_err)
     
@@ -266,16 +266,16 @@ def get_service_definition():
 
         "callbackPayloadDef": {
                 "attributes": [                    
-                    # {
-                    #     "apiName":  "user",
-                    #     "dataType": "text",
-                    #     "i18n": {
-                    #         "en_US": {
-                    #             "name":        "User message",
-                    #             "description": "User message"
-                    #         }
-                    #     }
-                    # },
+                    {
+                        "apiName":  "user-prompt",
+                        "dataType": "text",
+                        "i18n": {
+                            "en_US": {
+                                "name":        "User message",
+                                "description": "User message"
+                            }
+                        }
+                    },
                     {
                         "apiName":  "system",
                         "dataType": "text",
@@ -327,7 +327,7 @@ def get_service_definition():
 
                 ],
                 "fields": [],
-                "userDrivenMapping": True #causes the incoming mapping to appear when installing in the UI, need Admin to whitelist fields whose APIName can then be given in the flow step config so that they can be updated via API
+                "userDrivenMapping": True
             }
         })
 
