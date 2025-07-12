@@ -3,14 +3,14 @@
   "info": {
     "title": "Calculate Formula",
     "version": "1.0.1",
-    "description": "Calculates and Excel formula",
+    "description": "Calculates an Excel formula",
     "x-providerName": "theworkflowpro.com",
     "x-schemaVersion": "1.0.1",
     "x-supportContact": "tyron@theworkflowpro.com"
   },
   "servers": [
     {
-      "url": "https://marketo-ssfs-demo-telnyxviewer.replit.app/calcFormula"
+      "url": "https://xxx.replit.app/calcFormula"
     }
   ],
   "tags": [
