@@ -1,0 +1,243 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "Send SMS",
+    "version": "1.0.0",
+    "description": "Uses the Telnyx API to send an SMS message",
+    "x-providerName": "theworkflowpro.com",
+    "x-schemaVersion": "1.0.0",
+    "x-supportContact": "tyron@theworkflowpro.com"
+  },
+  "servers": [
+    {
+      "url": "https://marketo-ssfs-demo-telnyxviewer.replit.app/sendSMS"
+    }
+  ],
+  "tags": [
+    {
+      "name": "flow action",
+      "description": "Send SMS action"
+    }
+  ],
+  "paths": {
+    "/serviceIcon": {
+      "get": {
+        "summary": "Returns 32x32 PNG for the Flow Step bar",
+        "operationId": "serviceIcon",
+        "responses": {
+          "200": {
+            "description": "PNG icon",
+            "content": {
+              "image/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/brandIcon": {
+      "get": {
+        "summary": "Returns 32x32 PNG for the admin listing",
+        "operationId": "brandIcon",
+        "responses": {
+          "200": {
+            "description": "PNG icon",
+            "content": {
+              "image/*": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/getServiceDefinition": {
+      "get": {
+        "tags": [
+          "flow action"
+        ],
+        "summary": "Returns the SSFS service definition",
+        "operationId": "getServiceDefinition",
+        "responses": {
+          "200": {
+            "description": "Definition JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/serviceDefinition"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/submitAsyncAction": {
+      "post": {
+        "tags": [
+          "flow action"
+        ],
+        "summary": "Processes the flow step invocation",
+        "operationId": "submitAsyncAction",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/async"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted: Marketo will await the callback"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "500": {
+            "description": "Server error"
+          }
+        },
+        "callbacks": {
+          "selfServiceFlowComplete": {
+            "{$request.body#/flowComplete}": {
+              "post": {
+                "parameters": [],
+                "requestBody": {
+                  "required": true,
+                  "content": {
+                    "application/json": {
+                      "schema": {
+                        "$ref": "#/components/schemas/flowCallBack"
+                      }
+                    }
+                  }
+                },
+                "responses": {
+                  "200": {
+                    "description": "Callback received"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "tags": [
+          "flow action"
+        ],
+        "summary": "Service health check",
+        "operationId": "status",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/serviceStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "basicAuth": {
+        "type": "http",
+        "scheme": "basic",
+        "x-realm-required": false
+      }
+    },
+    "schemas": {
+      "async": {
+        "type": "object",
+        "description": "Invocation payload Marketo POSTs to /submitAsyncAction."
+      },
+      "flowCallBack": {
+        "type": "object",
+        "description": "Result payload your service POSTs back to Marketo.",
+        "properties": {
+          "status": {
+            "type": "string",
+            "example": "completed"
+          },
+          "attributes": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "serviceDefinition": {
+        "type": "object",
+        "required": [
+          "apiName",
+          "i18n",
+          "primaryAttribute",
+          "invocationPayloadDef",
+          "callbackPayloadDef"
+        ],
+        "properties": {
+          "apiName": {
+            "type": "string",
+            "example": "send-sms"
+          },
+          "primaryAttribute": {
+            "type": "string",
+            "example": "to_phone"
+          },
+          "i18n": {
+            "type": "object",
+            "example": {
+              "en_US": {
+                "name": "Send SMS",
+                "description": "Sends an SMS message to a phone number"
+              }
+            }
+          },
+          "invocationPayloadDef": {
+            "$ref": "#/components/schemas/async"
+          },
+          "callbackPayloadDef": {
+            "$ref": "#/components/schemas/flowCallBack"
+          }
+        }
+      },
+      "serviceStatus": {
+        "type": "object",
+        "description": "Health\u2011check response",
+        "properties": {
+          "status": {
+            "type": "string",
+            "example": "ok"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "basicAuth": []
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+entrypoint = "main.py"
+modules    = ["python-3.10:v20-20230824-f46249a"]
+
+hidden = [".pythonlibs"]
+
+[nix]
+channel  = "stable-23_05"
+packages = ["glibcLocales", "libyaml"]
+
+[env]                 # ← add; Replit passes $PORT in Cloud Run
+PORT = "3000"
+
+# ---------- local Run button ----------
+run = "gunicorn -w 2 -k gevent --bind 0.0.0.0:$PORT main:app"
+
+[deployment]
+run = ["sh", "-c",
+       "gunicorn -w 2 -k gevent --bind 0.0.0.0:${PORT} main:app"]
+deploymentTarget = "cloudrun"
+
+[[ports]]
+localPort    = 3000
+externalPort = 80
