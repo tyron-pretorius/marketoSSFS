@@ -5,7 +5,7 @@ import pandas as pd
 
 MAX_REQUESTS_PER_MINUTE = 60
 TIME_INTERVAL = 60 / MAX_REQUESTS_PER_MINUTE
-SERVICE_ACCOUNT_FILE = 'inbound-footing-412823-c2ffc4659d84.json'
+SERVICE_ACCOUNT_FILE = 'inbound-footing-xxx-123.json'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
 def _get_service():
