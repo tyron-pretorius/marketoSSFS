@@ -5,13 +5,13 @@ import os, requests, pandas as pd, json, traceback, pytz
 import googlesheets_functions
 from . import telnyx_functions
 
-bp = Blueprint("sendSMS", __name__, url_prefix="/sendSMS")
+base = "sendSMS"
+bp = Blueprint(base, __name__, url_prefix=f"/{base}")
 
 # ---------- CONFIG ----------
-base = "sendSMS"
-SMS_SHEET_LEADS   = f"{base}Leads"
-SMS_SHEET_BATCHES = f"{base}Batches"
-SMS_SPREADSHEET_ID = "1DqUYub7vrnhEw2N5LOWRAWAZwYAzE3P-E-RPXqRhkws"
+SHEET_LEADS   = f"{base}Leads"
+SHEET_BATCHES = f"{base}Batches"
+SPREADSHEET_ID = "xxx" #change this
 pacific        = pytz.timezone("America/Los_Angeles")
 MAX_CELL  = 50_000
 SAFE_SLICE = 48_000          # leave UTF-8 head-room
@@ -152,9 +152,9 @@ def submit_async_action():
         # ---------- write to Sheets once ----------
         try:
             if rows_leads:
-                googlesheets_functions.writeDF2Sheet(pd.DataFrame(rows_leads), SMS_SHEET_LEADS, SMS_SPREADSHEET_ID)
+                googlesheets_functions.writeDF2Sheet(pd.DataFrame(rows_leads), SHEET_LEADS, SPREADSHEET_ID)
 
-            googlesheets_functions.writeDF2Sheet(pd.DataFrame([batch_row]), SMS_SHEET_BATCHES, SMS_SPREADSHEET_ID)
+            googlesheets_functions.writeDF2Sheet(pd.DataFrame([batch_row]), SHEET_BATCHES, SPREADSHEET_ID)
         except Exception as gs_err:
             print("Sheets logging error:", gs_err)
 
@@ -170,7 +170,7 @@ def submit_async_action():
         fail_row |= _split_long_text("request", json.dumps(data, ensure_ascii=False))
 
         try:
-            googlesheets_functions.writeDF2Sheet(pd.DataFrame([fail_row]), SMS_SHEET_BATCHES, SMS_SPREADSHEET_ID)
+            googlesheets_functions.writeDF2Sheet(pd.DataFrame([fail_row]), SHEET_BATCHES, SPREADSHEET_ID)
         except Exception as gs_err:
             print("Sheets error while logging fatal failure:", gs_err)
 
