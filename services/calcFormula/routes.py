@@ -5,13 +5,13 @@ import os, requests, pandas as pd, json, traceback, pytz
 import googlesheets_functions
 from . import formula_functions
 
-bp = Blueprint("calcFormula", __name__, url_prefix="/calcFormula")
+base = "calcFormula"
+bp = Blueprint(base, __name__, url_prefix=f"/{base}")
 
 # ---------- CONFIG ----------
-base = "calcFormula"
 SHEET_LEADS   = f"{base}Leads"
 SHEET_BATCHES = f"{base}Batches"
-SPREADSHEET_ID = "1DqUYub7vrnhEw2N5LOWRAWAZwYAzE3P-E-RPXqRhkws"
+SPREADSHEET_ID = "xxx" #change this
 pacific        = pytz.timezone("America/Los_Angeles")
 MAX_CELL = 50000          # Sheets’ absolute limit
 SAFE_SLICE = 48000        # leave UTF-8 head-room
@@ -130,7 +130,7 @@ def submit_async_action():
                 single_cb = {
                     "leadData": { "id": lead_id },
                     "activityData": {
-                        "formula-error": error,
+                        "formula_error": error,
                         "success":   False
                     }
                 }
@@ -246,7 +246,7 @@ def get_service_definition():
                     }
                 }
             ],
-            "userDrivenMapping": False, #causes the outgoing mapping to appear when installing in the UI
+            "userDrivenMapping": False,
             "fields": []
         },
 
@@ -275,7 +275,13 @@ def get_service_definition():
                           "i18n": { "en_US": { "name": "Formula result",                                                                                          
                                               "description": "Formula result" } }
                     },
-                    {     "apiName": "formula-error",        
+
+                    {     "apiName": "formula_value",        
+                          "dataType": "text",
+                          "i18n": { "en_US": { "name": "Formula Value",                                                                                          
+                                              "description": "Formula Value" } }
+                    },
+                    {     "apiName": "formula_error",        
                           "dataType": "text",
                           "i18n": { "en_US": { "name": "Formula Error",                                                                                          
                                               "description": "Formula Error" } }
