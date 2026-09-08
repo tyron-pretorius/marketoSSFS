@@ -2,6 +2,7 @@
 from flask import Blueprint, request, jsonify, Response, send_file, send_from_directory
 from datetime import datetime
 import os, requests, pandas as pd, json, traceback, pytz
+from threading import Thread
 import googlesheets_functions
 from . import telnyx_functions
 
@@ -60,13 +61,11 @@ def brand_icon():
     return send_file("wfp_logo_pink.png", mimetype="image/png")
 
 # ---------- SSFS ENDPOINT ----------
-@bp.route("/submitAsyncAction", methods=["POST"])
-def submit_async_action():
-    ts  = datetime.now(pacific).strftime("%Y-%m-%d %H:%M:%S")
+def _process_batch_async(data: dict, ts: str) -> None:
+    """Do all the work, then call Marketo back. Runs off the request thread."""
     rows_leads:   list[dict] = []
     callback_objects: list[dict] = []
     cb_response = ""
-    data = request.get_json(force=True)
 
     try:
 
@@ -158,7 +157,8 @@ def submit_async_action():
         except Exception as gs_err:
             print("Sheets logging error:", gs_err)
 
-        return ("", 202) if r.ok else (jsonify({"error": r.text}), 500)
+        if not r.ok:
+            print(f"Callback failed: HTTP {r.status_code} - {r.text}")
 
     except Exception as e:
         fail_row = {
@@ -174,7 +174,39 @@ def submit_async_action():
         except Exception as gs_err:
             print("Sheets error while logging fatal failure:", gs_err)
 
-        return jsonify({"error": "server error"}), 500
+        print("Fatal error in background processing:", e)
+
+@bp.route("/submitAsyncAction", methods=["POST"])
+def submit_async_action():
+    """Accept the invocation and hand the work to a background thread.
+
+    Marketo is told 202 straight away, so the flow step is never sitting and
+    waiting on this service. All the real work - and the callback that
+    actually applies the lead updates - then happens in _process_batch_async.
+
+    Because the HTTP response has already been sent by then, anything that
+    goes wrong afterwards can only be logged and written to the batches
+    sheet; it cannot be returned to Marketo. That is the trade-off for not
+    holding the flow step open.
+    """
+    ts = datetime.now(pacific).strftime("%Y-%m-%d %H:%M:%S")
+    data = request.get_json(force=True)
+
+    try:
+        Thread(target=_process_batch_async, args=(data, ts), daemon=True).start()
+        return "", 202
+
+    except Exception as e:
+        fail_row = {
+            "timestamp": ts,
+            "error": f"Failed to start background processing: {e}\n{traceback.format_exc()}",
+        }
+        try:
+            googlesheets_functions.writeDF2Sheet(pd.DataFrame([fail_row]), SHEET_BATCHES, SPREADSHEET_ID)
+        except Exception as gs_err:
+            print("Sheets error while logging thread start failure:", gs_err)
+
+        return jsonify({"error": "Failed to start processing"}), 500
 
 @bp.route("/getServiceDefinition")
 def get_service_definition():

@@ -114,18 +114,49 @@ A flow attribute that needs a dropdown declares:
 
 ## 5. `/submitAsyncAction` structure
 
-Same shape in every service:
+Split across two functions in every service: a thin route handler that answers
+Marketo instantly, and a background worker that does everything else.
 
-1. `data = request.get_json()` — everything Marketo sent.
-2. Loop over `data["objectData"]` — one iteration per lead, up to 1000.
-3. Pull what you need from `flowStepContext` (marketer config) and
+### The route handler — `submit_async_action()`
+
+1. `data = request.get_json(force=True)` — everything Marketo sent.
+2. Stamp a timestamp (it becomes the log row's id).
+3. Hand both to a daemon `Thread` running `_process_batch_async`.
+4. `return "", 202` immediately.
+
+That's the whole handler. Marketo gets its 202 in milliseconds and stops
+waiting on the service.
+
+### The background worker — `_process_batch_async(data, timestamp)`
+
+1. Loop over `data["objectData"]` — one iteration per lead, up to 1000.
+2. Pull what you need from `flowStepContext` (marketer config) and
    `objectContext` (lead fields; `id` always).
-4. Run the custom logic.
-5. Build a **callback object** for that lead and append it to a list.
-6. Append a log row for that lead.
-7. **After the loop**, make ONE callback request to Marketo containing every
-   callback object.
-8. Write the lead rows and one batch summary row to Sheets.
+3. Run the custom logic.
+4. Build a **callback object** for that lead and append it to a list.
+5. Append a log row for that lead.
+6. **After the loop**, make ONE callback request to Marketo containing every
+   callback object. **This callback is what actually applies the updates** —
+   the 202 told Marketo the job was accepted, nothing more.
+7. Write the lead rows and one batch summary row to Sheets.
+
+### Why bother, when SSFS already has no 30-second timeout
+
+The flow step **waits** for the callback before moving to the next step, but
+that is Marketo waiting on the callback — not on the HTTP response. Answering
+202 up front separates the two, which buys three things:
+
+- The HTTP request isn't held open for the length of the work, so a slow
+  batch can't be killed by a proxy, load balancer or worker timeout.
+- The web worker is freed immediately, so concurrent invocations don't queue
+  behind each other.
+- Long work (per-lead API calls, image generation, uploads) becomes safe to do
+  at 1000-lead scale.
+
+**The trade-off:** once the 202 is sent, there is no HTTP response left to
+fail with. Anything that goes wrong afterwards can only be `print`ed and
+written to the batches sheet — so the Sheets log stops being optional
+convenience and becomes the only place a background failure is visible.
 
 ### The callback object
 
@@ -285,7 +316,8 @@ API names, and the admin whitelists which fields the step may overwrite.
 5. Write `getServiceDefinition` **first** — the flow attributes and callback
    attributes you declare there are the names you then use in
    `submitAsyncAction`.
-6. Update `submitAsyncAction` to read those names and build the callback object.
+6. Update `_process_batch_async` to read those names and build the callback
+   object. Leave `submitAsyncAction` alone — it only starts the thread.
 7. Add `/getPicklist` if any flow attribute is a dropdown.
 8. In `swagger.json`: title, version, description, provider domain, support
    contact, the `servers` URL (base + `/<name>`), the tags, the `apiName` and the
