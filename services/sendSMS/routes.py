@@ -1,7 +1,8 @@
-# services/hearAbout/routes.py
+# services/sendSMS/routes.py
 from flask import Blueprint, request, jsonify, Response, send_file, send_from_directory
 from datetime import datetime
-import os, requests, pandas as pd, json, traceback, pytz
+import os, requests, pandas as pd, json, time, traceback, pytz
+import concurrent.futures
 from threading import Thread
 import googlesheets_functions
 from . import telnyx_functions
@@ -16,6 +17,8 @@ SPREADSHEET_ID = "xxx" #change this
 pacific        = pytz.timezone("America/Los_Angeles")
 MAX_CELL  = 50_000
 SAFE_SLICE = 48_000          # leave UTF-8 head-room
+THREADS   = 50               # Sized for latency, not for rate: the limiter in
+                             # telnyx_functions holds the account ceiling
 
 # ---------- AUTH ----------
 def _check_auth(username, password):
@@ -51,6 +54,62 @@ def require_basic_auth():
                 {"WWW-Authenticate": 'Basic realm=Workflow Pro Send SMS'}
             )
 
+# ---------- SHEETS LOGGING ----------
+def _write_rows_with_retry(rows: list[dict], sheet_name: str, ts: str,
+                           max_attempts: int = 3) -> None:
+    """Write rows to Sheets, retrying in smaller chunks before giving up.
+
+    A thousand-lead batch is one large write, and a single transient failure
+    would otherwise lose the lot. Each size is tried with backoff, then a
+    smaller one; a final failure is recorded on the batch row so the loss is
+    visible rather than silent.
+    """
+    if not rows:
+        return
+
+    last_err = None
+    for size in (len(rows), 10, 1):
+        try:
+            for start in range(0, len(rows), size):
+                chunk = rows[start:start + size]
+                for attempt in range(max_attempts):
+                    try:
+                        googlesheets_functions.writeDF2Sheet(
+                            pd.DataFrame(chunk), sheet_name, SPREADSHEET_ID)
+                        break
+                    except Exception as e:
+                        last_err = e
+                        if attempt == max_attempts - 1:
+                            raise
+                        time.sleep(2 ** (attempt + 1))      # 2s, 4s
+            return
+        except Exception as e:
+            last_err = e                                     # try a smaller size
+
+    try:
+        googlesheets_functions.updateBatchRow(
+            ts, {"error": f"Failed to log {len(rows)} rows to {sheet_name}: {last_err}"},
+            SHEET_BATCHES, SPREADSHEET_ID)
+    except Exception as gs_err:
+        print("Could not record the Sheets failure on the batch row:", gs_err)
+
+def _progress(ts: str, note: str) -> None:
+    """Best-effort note on the batch row, so a long batch visibly moves."""
+    try:
+        googlesheets_functions.updateBatchRow(
+            ts, {"cb_response": note}, SHEET_BATCHES, SPREADSHEET_ID)
+    except Exception:
+        pass
+
+def _short_error(exc: Exception, message: str = "") -> str:
+    """A capped message plus the stack, for storing and reading.
+
+    `message` is Telnyx's own wording where there is one; the exception's own
+    text during an outage is a page of markup.
+    """
+    stack = "".join(traceback.format_tb(exc.__traceback__))
+    return f"{(message or str(exc))[:telnyx_functions.MAX_ERROR_CHARS]}\n{stack}"
+
 # ---------- STATIC ICONS ----------
 @bp.route("/serviceIcon")
 def service_icon():
@@ -61,6 +120,34 @@ def brand_icon():
     return send_file("wfp_logo_pink.png", mimetype="image/png")
 
 # ---------- SSFS ENDPOINT ----------
+def _send_one(obj: dict) -> dict:
+    """Send one lead's SMS and report the outcome. Runs on a pool thread."""
+    ctx_lead = obj.get("objectContext", {})
+    ctx_step = obj.get("flowStepContext", {})
+
+    result = {
+        "lead_id":    ctx_lead.get("id"),
+        "from_phone": ctx_step.get("from_phone", ""),
+        "to_phone":   ctx_step.get("to_phone", ""),
+        "message":    ctx_step.get("message", ""),
+        "sms_response": "",
+        "sms_delivery_error": "",
+        "error": "",
+    }
+
+    try:
+        result["sms_response"] = telnyx_functions.sendSMS(
+            result["to_phone"], result["from_phone"], result["message"])
+    except Exception as per_lead_err:
+        # Telnyx's own code and wording go in their own column so the sheet can
+        # be filtered by them; the stack stays in `error` for debugging. Both
+        # are capped, because an outage answers with a page of markup.
+        detail = telnyx_functions.describe_error(per_lead_err)
+        result["sms_delivery_error"] = detail
+        result["error"] = _short_error(per_lead_err, detail)
+
+    return result
+
 def _process_batch_async(data: dict, ts: str) -> None:
     """Do all the work, then call Marketo back. Runs off the request thread."""
     rows_leads:   list[dict] = []
@@ -68,59 +155,65 @@ def _process_batch_async(data: dict, ts: str) -> None:
     cb_response = ""
 
     try:
+        object_data = data.get("objectData", [])
+        total = len(object_data)
 
-        for obj in data.get("objectData", []):
-            ctx_lead   = obj.get("objectContext", {})
-            ctx_step   = obj.get("flowStepContext", {})
-            from_phone   = ctx_step.get("from_phone", "")
-            to_phone   = ctx_step.get("to_phone", "")
-            message    = ctx_step.get("message", "")
-            lead_id    = ctx_lead.get("id")
+        # The batch row is written here, inside the thread, rather than before
+        # the 202: it is a Sheets write with its own retries, and holding the
+        # response open for it is what makes Marketo time the invocation out.
+        # It has to exist before _progress can update it.
+        batch_row = {"timestamp": ts, "error": "",
+                     "cb_response": f"0/{total} leads sent"}
+        batch_row |= _split_long_text("request", json.dumps(data, ensure_ascii=False))
+        _write_rows_with_retry([batch_row], SHEET_BATCHES, ts)
 
-            row = {
+        # ---------- send, in parallel ----------
+        # Each send is a round-trip to Telnyx, so a batch sent one at a time is
+        # a batch spent waiting. The rate limiter, not the pool size, is what
+        # keeps this inside the account ceiling.
+        results: list[dict] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as pool:
+            futures = [pool.submit(_send_one, obj) for obj in object_data]
+            for done, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+                try:
+                    results.append(future.result())
+                except Exception as worker_err:
+                    # _send_one handles its own failures, so reaching here means
+                    # the worker itself died. Report it rather than lose a lead.
+                    results.append({
+                        "lead_id": "", "from_phone": "", "to_phone": "",
+                        "message": "", "sms_response": "",
+                        "sms_delivery_error": "",
+                        "error": f"Worker exception: {worker_err}",
+                    })
+                if done % 50 == 0 or done == total:
+                    _progress(ts, f"{done}/{total} leads sent")
+
+        # ---------- build the callback ----------
+        for r in results:
+            success = not r["error"]
+            callback_objects.append({
+                "leadData": {"id": r["lead_id"]},
+                "activityData": {
+                    "from_phone":     r["from_phone"],
+                    "to_phone_value": r["to_phone"],
+                    "message":        r["message"],
+                    "sms_response":   r["sms_response"],
+                    "sms_error":      r["sms_delivery_error"],
+                    "success":        success,
+                },
+            })
+            rows_leads.append({
                 "timestamp": ts,
                 "lead_id": (f"https://app-ab20.marketo.com/leadDatabase/"
-                            f"loadLeadDetail?leadId={lead_id}"),
-                "from_phone":from_phone,
-                "to_phone":to_phone,
-                "message":message,
-                "sms_response": "",
-                "error": ""
-            }
-
-            try:
-                response = telnyx_functions.sendSMS(to_phone,from_phone, message)
-
-                callback_objects.append({
-                    "leadData": {
-                        "id":         lead_id
-                    },
-                    "activityData": {
-                        "from_phone": from_phone,
-                        "to_phone_value":  to_phone,
-                        "message":  message,
-                        "sms_response": response,
-                        "success":           True
-                    }
-                })
-
-                row["sms_response"] = response
-
-            except Exception as per_lead_err:
-                # still return an entry so the batch keeps going
-                callback_objects.append({
-                    "leadData": { "id": lead_id },
-                    "activityData": {
-                        "from_phone": from_phone,
-                        "to_phone_value":  to_phone,
-                        "message":  message,
-                        "sms_error": str(per_lead_err),
-                        "success": False,
-                    }
-                })
-                row["error"] = f"{per_lead_err}\n{traceback.format_exc()}"
-
-            rows_leads.append(row)
+                            f"loadLeadDetail?leadId={r['lead_id']}"),
+                "from_phone":   r["from_phone"],
+                "to_phone":     r["to_phone"],
+                "message":      r["message"],
+                "sms_response": r["sms_response"],
+                "sms_delivery_error": r["sms_delivery_error"],
+                "error":        r["error"],
+            })
 
         # ---------- single callback ----------
         r = requests.post(
@@ -137,23 +230,17 @@ def _process_batch_async(data: dict, ts: str) -> None:
             timeout=10,
         )
 
-        cb_response =r.text
+        cb_response = r.text
 
-        # ---------- batch summary ----------
-        batch_row = {
-            "timestamp": ts,
-            "error": "" if r.ok else f"Callback HTTP {r.status_code}",
-            "cb_response": cb_response
-        }
-        # split the potentially huge *request* JSON
-        batch_row |= _split_long_text("request", json.dumps(data, ensure_ascii=False))
+        # ---------- write to Sheets ----------
+        _write_rows_with_retry(rows_leads, SHEET_LEADS, ts)
 
-        # ---------- write to Sheets once ----------
         try:
-            if rows_leads:
-                googlesheets_functions.writeDF2Sheet(pd.DataFrame(rows_leads), SHEET_LEADS, SPREADSHEET_ID)
-
-            googlesheets_functions.writeDF2Sheet(pd.DataFrame([batch_row]), SHEET_BATCHES, SPREADSHEET_ID)
+            googlesheets_functions.updateBatchRow(
+                ts,
+                {"error": "" if r.ok else f"Callback HTTP {r.status_code}",
+                 "cb_response": cb_response},
+                SHEET_BATCHES, SPREADSHEET_ID)
         except Exception as gs_err:
             print("Sheets logging error:", gs_err)
 
@@ -161,20 +248,16 @@ def _process_batch_async(data: dict, ts: str) -> None:
             print(f"Callback failed: HTTP {r.status_code} - {r.text}")
 
     except Exception as e:
-        fail_row = {
-            "timestamp": ts,
-            "error": f"{e}\n{traceback.format_exc()}",
-            "cb_response": cb_response,
-        }
-
-        fail_row |= _split_long_text("request", json.dumps(data, ensure_ascii=False))
-
         try:
-            googlesheets_functions.writeDF2Sheet(pd.DataFrame([fail_row]), SHEET_BATCHES, SPREADSHEET_ID)
+            googlesheets_functions.updateBatchRow(
+                ts,
+                {"error": _short_error(e), "cb_response": cb_response},
+                SHEET_BATCHES, SPREADSHEET_ID)
         except Exception as gs_err:
             print("Sheets error while logging fatal failure:", gs_err)
 
         print("Fatal error in background processing:", e)
+
 
 @bp.route("/submitAsyncAction", methods=["POST"])
 def submit_async_action():
