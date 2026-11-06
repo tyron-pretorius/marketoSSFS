@@ -7,7 +7,27 @@ from openai import OpenAI
 
 from rate_limiters import SlidingWindowRateLimiter
 
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+# Built on first use, not at import.
+#
+# main.py imports every service's blueprint, so anything that runs at import
+# time runs for all of them. Constructing the client here meant a missing
+# OPENAI_API_KEY stopped the whole app from starting - including the services
+# that have nothing to do with OpenAI.
+_client = None
+
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set, so the E164 Formatting service "
+                "cannot run. Add it to .env locally or to the Secrets pane "
+                "on Replit."
+            )
+        _client = OpenAI(api_key=api_key)
+    return _client
 
 # Requests per second, process-wide. One lead is one call, and the batch runs
 # on a thread pool, so nothing else here is holding the rate down. The retry
@@ -40,7 +60,7 @@ def completions(user_message: str, system_prompt: str,
     for attempt in range(max_retries):
         try:
             _LIMITER.acquire()
-            response = client.chat.completions.create(
+            response = _get_client().chat.completions.create(
                 model=model,
                 max_completion_tokens=MAX_COMPLETION_TOKENS,
                 response_format={"type": "json_object"},

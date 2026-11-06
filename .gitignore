@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+# Google service account key - the file itself is the secret
+*.json
+!services/*/swagger.json

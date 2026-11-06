@@ -32,9 +32,16 @@ The only tradeoff: far more setup than a webhook.
 | `main.py` | Router only. Registers each service's blueprint so an incoming call reaches the right service. |
 | `services/<name>/routes.py` | All endpoints for one service, plus the custom logic. |
 | `services/<name>/swagger.json` | Lists the endpoints, the data types each expects, and the shape sent back. This is how Marketo learns to talk to the service. |
+| `services/<name>/*_functions.py` | API clients used by that one service only — Telnyx for `sendSMS`, Neutrino for `e164Formatting`. |
 | `googlesheets_functions.py` | Logging of inputs and outputs to a Google Sheet. |
+| `marketo_functions.py` | Marketo's own REST API, for the things the invocation payload doesn't carry (§8). |
+| `rate_limiters.py` | A sliding window, shared process-wide, so a thread pool doesn't burst past a provider's ceiling. |
+| `safe_errors.py` | Failure text capped to something a log and a callback can carry. |
 | service account JSON | Credentials for the Sheets API. |
 | logo PNG | Served by `/serviceIcon` and `/brandIcon`. |
+
+A client used by one service lives in that service's folder; one that more than
+one service could use lives at the root. That's the whole rule.
 
 `swagger.json` tells Marketo **what endpoints exist**; `routes.py` defines **how
 the service responds** when Marketo calls them.
@@ -262,6 +269,65 @@ Three parts:
 Global attributes, my tokens, subscription, program member, trigger tokens and
 campaign tokens can also be brought in here.
 
+### `triggerContext` — what set the campaign off
+
+A fourth part, and the one that saves the most configuration. Set it and
+Marketo sends the triggering activity along with each lead:
+
+```python
+"invocationPayloadDef": {
+    "flowAttributes": [...],
+    "triggerContext": True,
+    "userDrivenMapping": False,
+    "fields": []
+}
+```
+
+The marketer then types nothing, and a cloned program needs no edit, because
+the service reads the form (or email, or list) out of the trigger rather than
+out of a field somebody filled in.
+
+⚠️ **It comes back under a different name, in a different place.** You ask for
+`triggerContext` at the top of `invocationPayloadDef`; Marketo returns
+`triggeringContext`, nested inside **each `objectData` entry** — not at the top
+level of the payload. Confirmed against a real "Fill Out Form" invocation:
+
+```json
+"objectData": [{
+  "objectContext": {"id": 7315607},
+  "triggeringContext": {
+    "activityTypeName": "Fill Out Form",
+    "primaryAttributeValue": "<program name>.<form name>",
+    "primaryAttributeValueId": 7048,
+    "attributes": {"Webform ID": "7048", "Form Fields": "<php>", "Referrer URL": "..."}
+  }
+}]
+```
+
+Three things worth knowing about what's in there:
+
+- **`primaryAttributeValue` is qualified** — `<program name>.<form name>`. The
+  form name is after the *last* dot, because a program name may contain dots of
+  its own.
+- **`primaryAttributeValueId` is the form id.** Use it rather than looking the
+  form up by name: cloned programs reuse form names, so the name alone isn't
+  unique across the instance.
+- **`Form Fields` is PHP-serialised**, not JSON —
+  `a:28:{s:6:"module";s:11:"leadCapture";…}`, where each number is a *byte*
+  count. Parse it by walking those lengths, not by splitting on quotes: a
+  submitted value can contain quotes and semicolons of its own. See
+  `parse_php_serialized_map` in `services/captureConsent/consent_functions.py`.
+
+**There is no timestamp anywhere in it.** If you need the time the activity
+happened, the closest you can get is the moment your flow step ran — seconds
+later on a trigger campaign. Say so in the log rather than implying precision
+you don't have.
+
+Because the trigger arrives per lead, a batch can in principle contain leads
+triggered by different forms. If your service reads something once per batch
+(the form's fields, say), check each lead's trigger matches the one you read
+and fail the rest rather than recording the wrong thing against them.
+
 ### `callbackPayloadDef` — what you send back
 
 - **`attributes`** — everything you want visible in the activity detail. Must
@@ -307,7 +373,85 @@ API names, and the admin whitelists which fields the step may overwrite.
 
 ---
 
-## 8. Adding a new service to this repo
+## 8. Calling Marketo's REST API
+
+Most services never need this. Marketo sends you everything in the invocation
+payload, and you answer in the callback. But some things simply aren't in the
+payload — the fields on a form, a program membership — and then you have to ask
+Marketo directly. `marketo_functions.py` is that client, and `captureConsent`
+is the service that uses it.
+
+This is a **different API with different credentials** from the flow step
+mechanism. From Admin → Web Services:
+
+```bash
+MARKETO_BASE_URL=https://123-ABC-456.mktorest.com
+MARKETO_CLIENT_ID=...
+MARKETO_CLIENT_SECRET=...
+```
+
+### Things that catch people out
+
+**The token goes in a header.** `Authorization: Bearer <token>`. Passing it as
+a query parameter instead returns `603 Access denied`, which reads like a
+permissions problem and is not one — you will go and check the API user's role
+before you think to check this.
+
+**Cache the token.** It lasts an hour, and fetching one counts against the same
+API limit as everything else, so a token per request halves your allowance.
+
+**HTTP 200 doesn't mean it worked.** Marketo answers failures with 200 and
+`"success": false`. Check the body, not the status code:
+
+```python
+def _check(body, what):
+    if not body.get("success", False):
+        raise RuntimeError(f"{what} failed: {json.dumps(body.get('errors', body))}")
+    return body
+```
+
+**The limits are 100 calls per 20 seconds and 10 concurrent.** Those are the
+platform's, identical in every subscription and sandbox — raising a constant in
+your code doesn't raise them, it just moves the failure to Marketo, which
+starts answering `606`. A service calling Marketo once per batch is nowhere
+near. One calling it *per lead* needs a rate limiter before it ever meets a
+real batch.
+
+### Working out which program called you
+
+The payload carries `campaignId` and nothing else about where it came from. The
+smart campaign record has a `folder`, which is either the program itself (type
+`Program`) or a campaign folder nested inside one — so walk upwards until a
+Program turns up. `get_program_for_campaign` does this, with a bounded loop so
+a malformed folder tree can't spin forever.
+
+Take the program's link from its own record rather than building one. The URL
+fragment differs by program type (`#ME` for a marketing event, and so on), so a
+hand-built link is wrong for some programs.
+
+### Writing program member fields
+
+`POST /rest/v1/programs/{id}/members.json`, 300 records per call.
+
+⚠️ **It updates existing members only — it will not enroll anyone.** A lead who
+isn't a member of the program comes back rejected, and that is by far the most
+common reason this kind of service reports a failure. It's a campaign design
+problem, not a bug: the flow step has to run inside the program whose
+membership it's writing to.
+
+Match the response back to your input by `leadId` first, then `seq`, then input
+order — and treat `updated`, `created` and `added` as success, anything else as
+a per-lead failure with Marketo's own reason attached.
+
+⚠️ **Program member fields have no text or textarea type.** Every string field
+is capped at 255 characters. Longer content has to be split across two fields
+and re-joined, which is why `captureConsent` writes `…ConsentText` and
+`…ConsentText2`. Decide what happens when it won't fit in both — a consent
+record cut short is worse than no record at all.
+
+---
+
+## 9. Adding a new service to this repo
 
 1. Create `services/<name>/`.
 2. Copy the closest existing `routes.py`, its swagger, and its functions module.
@@ -327,9 +471,31 @@ API names, and the admin whitelists which fields the step may overwrite.
     `https://<host>/<name>/install`.
 11. Create the log sheet tabs.
 
+⚠️ **Build API clients on first use, not at import.** `main.py` imports every
+blueprint, so anything at module level runs for all of them — and a client
+constructed there means a key missing for *your* service stops *everybody's*
+service from starting:
+
+```python
+_client = None
+
+def _get_client():
+    global _client
+    if _client is None:
+        api_key = os.getenv("SOME_API_KEY")
+        if not api_key:
+            raise RuntimeError("SOME_API_KEY is not set, so ... cannot run.")
+        _client = SomeClient(api_key=api_key)
+    return _client
+```
+
+The app then boots with no keys at all, you only hold credentials for the
+services you actually run, and a missing key arrives as that service's own
+error rather than a stack trace at startup.
+
 ---
 
-## 9. Install and test in Marketo
+## 10. Install and test in Marketo
 
 1. Deploy, then copy the primary domain.
 2. Admin → Service Providers → New Service, URL =
@@ -341,7 +507,7 @@ API names, and the admin whitelists which fields the step may overwrite.
 
 ---
 
-## 10. Known quirks and bugs
+## 11. Known quirks and bugs
 
 | Quirk | Consequence |
 |---|---|
@@ -353,10 +519,17 @@ API names, and the admin whitelists which fields the step may overwrite.
 | **Activity detail order is fixed** | Native Marketo fields (step ID, source) are interspersed with yours and can't be reordered. |
 | **Dropdown that isn't a dropdown** | A flow attribute without `hasPicklist` still renders a dropdown arrow, but is a free text field. |
 | `#` comments in `swagger.json` | Vague Marketo error on install. |
+| **`triggerContext` comes back as `triggeringContext`** | And nested inside each `objectData` entry, not at the top level. Looking where you asked finds nothing. |
+| **No timestamp in the trigger** | The closest you can record is when your flow step ran, which on a trigger campaign is seconds after the activity. |
+| **`Form Fields` is PHP-serialised** | Not JSON. Lengths are byte counts, and values can contain quotes and semicolons, so splitting on punctuation corrupts them. |
+| **Program member writes don't enroll** | A lead who isn't already a member comes back rejected. The flow step must run inside the program it writes to. |
+| **Program member fields cap at 255** | There is no text or textarea type, so longer content needs two fields and a join. |
+| **Marketo answers failures with HTTP 200** | Check `"success"` in the body; the status code tells you nothing. |
+| **REST token as a query parameter** | Returns `603 Access denied`, which looks like a permissions problem. Use the `Authorization: Bearer` header. |
 
 ---
 
-## 11. Hosting notes (Replit)
+## 12. Hosting notes (Replit)
 
 - Deploying needs the Replit Core plan ($20/month). Usage on top is small —
   two services for two weeks cost under $1.
