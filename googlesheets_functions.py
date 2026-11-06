@@ -74,6 +74,22 @@ _header_cache: dict[str, list[str]] = {}
 _row_index_cache: dict[str, int] = {}
 
 
+def _column_letter(index: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA.
+
+    Sheets runs past Z, and these logs get there: _split_long_text adds
+    request_2, callback_object_2 and so on when a value will not fit in one
+    cell. Arithmetic on a single character silently addresses the wrong
+    column once there are more than 26 of them.
+    """
+    letters = ""
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
+
+
 def _headers(sheet_name: str, spreadsheet_id: str) -> list[str]:
     key = f"{spreadsheet_id}:{sheet_name}"
     if key not in _header_cache:
@@ -126,7 +142,7 @@ def updateBatchRow(batch_id: str, updates: dict, sheet_name: str,
     for column_name, value in updates.items():
         if column_name not in headers:
             continue
-        letter = chr(ord("A") + headers.index(column_name))
+        letter = _column_letter(headers.index(column_name))
         data.append({
             "range": f"{sheet_name}!{letter}{row_index}",
             "values": [[str(value)]],
