@@ -2,7 +2,7 @@
 import os
 import telnyx
 
-from .rate_limiters import SlidingWindowRateLimiter
+from rate_limiters import SlidingWindowRateLimiter
 
 telnyx.api_key = os.environ['TELNYX_API_KEY']
 

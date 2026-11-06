@@ -1,4 +1,4 @@
-# services/sendSMS/rate_limiters.py
+# rate_limiters.py
 import threading
 import time
 from collections import deque

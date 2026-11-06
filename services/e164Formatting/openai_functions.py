@@ -5,7 +5,19 @@ from typing import Optional
 
 from openai import OpenAI
 
+from rate_limiters import SlidingWindowRateLimiter
+
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+# Requests per second, process-wide. One lead is one call, and the batch runs
+# on a thread pool, so nothing else here is holding the rate down. The retry
+# loop below already absorbs a 429, but absorbing one costs a visible wait
+# and a lead that spends all three attempts comes back None - which this
+# service records as "Unknown", a rate-limit problem wearing the disguise of
+# an unreadable phone number. Pacing the calls avoids taking the 429 at all.
+OPENAI_RPS = float(os.getenv("OPENAI_RPS", "20"))
+_LIMITER = SlidingWindowRateLimiter(max_requests=int(OPENAI_RPS),
+                                    window_seconds=1.0)
 
 # gpt-6-luna is a reasoning model, and that changes how it has to be called:
 #
@@ -27,6 +39,7 @@ def completions(user_message: str, system_prompt: str,
     """One JSON completion, or None once the retries are spent."""
     for attempt in range(max_retries):
         try:
+            _LIMITER.acquire()
             response = client.chat.completions.create(
                 model=model,
                 max_completion_tokens=MAX_COMPLETION_TOKENS,
