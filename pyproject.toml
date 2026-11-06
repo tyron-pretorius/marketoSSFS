@@ -14,6 +14,9 @@ google-auth = "^2.39.0"
 pandas = "^2.2.3"
 requests = "^2.32.3"
 pyyaml = "^6.0.2"
+formulas = "^1.3.4"
+pytz = "^2025.2"
+telnyx = "^2.1.5"
 
 [tool.pyright]
 # https://github.com/microsoft/pyright/blob/main/docs/configuration.md

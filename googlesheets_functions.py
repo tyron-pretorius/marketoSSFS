@@ -52,3 +52,93 @@ def writeRow2Sheet(row, sheet_name, spreadsheet_id ):
         body=body).execute()
 
     print(f"{result.get('updates').get('updatedCells')} cells updated.")
+
+
+# ---------------------------------------------------------------------------
+# Progress reporting
+#
+# writeDF2Sheet above appends. A long-running batch also needs to *change* a
+# row it already wrote - "200/1000 leads processed", then 400, then the final
+# callback response - so a marketer watching the sheet can see it moving
+# rather than waiting for one row to appear at the end.
+# ---------------------------------------------------------------------------
+
+# Headers change rarely, and a batch asks for them repeatedly.
+_header_cache: dict[str, list[str]] = {}
+
+# Where each batch's row is. Looked up once and remembered: a batch reports
+# progress many times, the sheet only ever has rows appended, so the row never
+# moves. Scanning the whole first column on every update is what exhausts the
+# read quota on a sheet with tens of thousands of rows - and a throttled
+# update does not raise, it simply never lands.
+_row_index_cache: dict[str, int] = {}
+
+
+def _headers(sheet_name: str, spreadsheet_id: str) -> list[str]:
+    key = f"{spreadsheet_id}:{sheet_name}"
+    if key not in _header_cache:
+        time.sleep(TIME_INTERVAL)
+        result = _get_service().spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_name}!1:1"
+        ).execute()
+        values = result.get("values") or [[]]
+        _header_cache[key] = values[0]
+    return _header_cache[key]
+
+
+def updateBatchRow(batch_id: str, updates: dict, sheet_name: str,
+                   spreadsheet_id: str) -> bool:
+    """Change named columns on the row whose first cell is `batch_id`.
+
+    `batch_id` is the timestamp written when the batch started. Give it
+    microsecond precision: Marketo fires parallel invocations inside the same
+    second, and at second precision they all find the same row - the first
+    batch collects everyone's progress while the rest sit unchanged.
+
+    Returns False when the row or the headers cannot be found, so a logging
+    problem never stops the work that is being logged.
+    """
+    headers = _headers(sheet_name, spreadsheet_id)
+    if not headers:
+        print(f"No headers on {sheet_name}; skipping batch update")
+        return False
+
+    cache_key = f"{spreadsheet_id}:{sheet_name}:{batch_id}"
+    row_index = _row_index_cache.get(cache_key)
+
+    if row_index is None:
+        time.sleep(TIME_INTERVAL)
+        column_a = _get_service().spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A:A"
+        ).execute().get("values", [])
+
+        for i, row in enumerate(column_a[1:], start=2):   # skip the header
+            if row and row[0] == batch_id:
+                row_index = i
+                break
+
+        if row_index is None:
+            print(f"Batch {batch_id} not found in {sheet_name}")
+            return False
+        _row_index_cache[cache_key] = row_index
+
+    data = []
+    for column_name, value in updates.items():
+        if column_name not in headers:
+            continue
+        letter = chr(ord("A") + headers.index(column_name))
+        data.append({
+            "range": f"{sheet_name}!{letter}{row_index}",
+            "values": [[str(value)]],
+        })
+
+    if not data:
+        print(f"No matching columns on {sheet_name} for {list(updates)}")
+        return False
+
+    time.sleep(TIME_INTERVAL)
+    _get_service().spreadsheets().values().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"valueInputOption": "RAW", "data": data},
+    ).execute(num_retries=2)
+    return True
